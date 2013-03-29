@@ -1,163 +1,189 @@
+require 'cmd/tap'
+require 'cmd/untap'
+
 module Homebrew extend self
+
+  DEPRECATED_TAPS = ['adamv-alt']
+
   def update
-    abort "Please `brew install git' first." unless system "/usr/bin/which git > /dev/null 2>&1"
+    unless ARGV.named.empty?
+      abort <<-EOS.undent
+        This command updates brew itself, and does not take formula names.
+        Use `brew upgrade <formula>`.
+      EOS
+    end
+    abort "Please `brew install git' first." unless which "git"
 
-    updater = RefreshBrew.new
-    if updater.update_from_masterbrew!
-      updater.report
-    else
+    # ensure GIT_CONFIG is unset as we need to operate on .git/config
+    ENV.delete('GIT_CONFIG')
+
+    cd HOMEBREW_REPOSITORY
+    git_init_if_necessary
+
+    report = Report.new
+    master_updater = Updater.new
+    master_updater.pull!
+    report.merge!(master_updater.report)
+
+    Dir["Library/Taps/*"].each do |tapd|
+      next unless File.directory?(tapd)
+
+      basename = Pathname.new(tapd).basename.to_s
+      if DEPRECATED_TAPS.include?(basename)
+        opoo "#{basename} is deprecated; please untap it"
+        next
+      end
+
+      cd tapd do
+        begin
+          updater = Updater.new
+          updater.pull!
+          report.merge!(updater.report) do |key, oldval, newval|
+            oldval.concat(newval)
+          end
+        rescue
+          tapd =~ %r{^Library/Taps/(\w+)-(\w+)}
+          onoe "Failed to update tap: #$1/#$2"
+        end
+      end
+    end
+
+    # we unlink first in case the formula has moved to another tap
+    Homebrew.unlink_tap_formula(report.removed_tapped_formula)
+    Homebrew.link_tap_formula(report.new_tapped_formula)
+
+    if report.empty?
       puts "Already up-to-date."
-    end
-  end
-end
-
-class RefreshBrew
-  REPOSITORY_URL   = "http://github.com/mxcl/homebrew.git"
-  INIT_COMMAND     = "git init"
-  CHECKOUT_COMMAND = "git checkout -q master"
-  UPDATE_COMMAND   = "git pull #{REPOSITORY_URL} master"
-  REVISION_COMMAND = "git log -l -1 --pretty=format:%H 2> /dev/null"
-  GIT_UP_TO_DATE   = "Already up-to-date."
-
-  formula_regexp   = 'Library/Formula/(.+?)\.rb'
-  ADDED_FORMULA    = %r{^\s+create mode \d+ #{formula_regexp}$}
-  UPDATED_FORMULA  = %r{^\s+#{formula_regexp}\s}
-  DELETED_FORMULA  = %r{^\s+delete mode \d+ #{formula_regexp}$}
-
-  example_regexp   = 'Library/Contributions/examples/([^.\s]+).*'
-  ADDED_EXAMPLE    = %r{^\s+create mode \d+ #{example_regexp}$}
-  UPDATED_EXAMPLE  = %r{^\s+#{example_regexp}}
-  DELETED_EXAMPLE  = %r{^\s+delete mode \d+ #{example_regexp}$}
-
-  attr_reader :added_formulae, :updated_formulae, :deleted_formulae, :installed_formulae
-  attr_reader :added_examples, :updated_examples, :deleted_examples
-  attr_reader :initial_revision
-
-  def initialize
-    @added_formulae, @updated_formulae, @deleted_formulae, @installed_formulae = [], [], [], []
-    @added_examples, @updated_examples, @deleted_examples = [], [], []
-    @initial_revision = self.current_revision
-  end
-
-  # Performs an update of the homebrew source. Returns +true+ if a newer
-  # version was available, +false+ if already up-to-date.
-  def update_from_masterbrew!
-    output = ''
-    HOMEBREW_REPOSITORY.cd do
-      if File.directory? '.git'
-        safe_system CHECKOUT_COMMAND
-      else
-        safe_system INIT_COMMAND
-      end
-      output = execute(UPDATE_COMMAND)
-    end
-
-    output.split("\n").reverse.each do |line|
-      case line
-      when ADDED_FORMULA
-        @added_formulae << $1
-      when DELETED_FORMULA
-        @deleted_formulae << $1
-      when UPDATED_FORMULA
-        @updated_formulae << $1 unless @added_formulae.include?($1) or @deleted_formulae.include?($1)
-      when ADDED_EXAMPLE
-        @added_examples << $1
-      when DELETED_EXAMPLE
-        @deleted_examples << $1
-      when UPDATED_EXAMPLE
-        @updated_examples << $1 unless @added_examples.include?($1) or @deleted_examples.include?($1)
-      end
-    end
-    @added_formulae.sort!
-    @updated_formulae.sort!
-    @deleted_formulae.sort!
-    @added_examples.sort!
-    @updated_examples.sort!
-    @deleted_examples.sort!
-    @installed_formulae = HOMEBREW_CELLAR.children.
-      select{ |pn| pn.directory? }.
-      map{ |pn| pn.basename.to_s }.sort
-
-    output.strip != GIT_UP_TO_DATE
-  end
-
-  def pending_formulae_changes?
-    !@updated_formulae.empty?
-  end
-
-  def pending_new_formulae?
-    !@added_formulae.empty?
-  end
-
-  def deleted_formulae?
-    !@deleted_formulae.empty?
-  end
-
-  def pending_examples_changes?
-    !@updated_examples.empty?
-  end
-
-  def pending_new_examples?
-    !@added_examples.empty?
-  end
-
-  def deleted_examples?
-    !@deleted_examples.empty?
-  end
-
-  def current_revision
-    HOMEBREW_REPOSITORY.cd { execute(REVISION_COMMAND).strip }
-  rescue
-    'TAIL'
-  end
-
-  def report
-    puts "Updated Homebrew from #{initial_revision[0,8]} to #{current_revision[0,8]}."
-    ## New Formulae
-    if pending_new_formulae?
-      ohai "The following formulae are new:"
-      puts_columns added_formulae
-    end
-    ## Deleted Formulae
-    if deleted_formulae?
-      ohai "The following formulae were removed:"
-      puts_columns deleted_formulae, installed_formulae
-    end
-    ## Updated Formulae
-    if pending_formulae_changes?
-      ohai "The following formulae were updated:"
-      puts_columns updated_formulae, installed_formulae
     else
-      puts "No formulae were updated."
-    end
-    ## New examples
-    if pending_new_examples?
-      ohai "The following external commands are new:"
-      puts_columns added_examples
-    end
-    ## Deleted examples
-    if deleted_examples?
-      ohai "The following external commands were removed:"
-      puts_columns deleted_examples
-    end
-    ## Updated Formulae
-    if pending_examples_changes?
-      ohai "The following external commands were updated:"
-      puts_columns updated_examples
-    else
-      puts "No external commands were updated."
+      puts "Updated Homebrew from #{master_updater.initial_revision[0,8]} to #{master_updater.current_revision[0,8]}."
+      report.dump
     end
   end
 
   private
 
-  def execute(cmd)
-    out = `#{cmd}`
+  def git_init_if_necessary
+    if Dir['.git/*'].empty?
+      safe_system "git init"
+      safe_system "git config core.autocrlf false"
+      safe_system "git remote add origin https://github.com/mxcl/homebrew.git"
+      safe_system "git fetch origin"
+      safe_system "git reset --hard origin/master"
+    end
+  rescue Exception
+    FileUtils.rm_rf ".git"
+    raise
+  end
+
+end
+
+class Updater
+  attr_reader :initial_revision, :current_revision
+
+  def pull!
+    safe_system "git checkout -q master"
+
+    @initial_revision = read_current_revision
+
+    # ensure we don't munge line endings on checkout
+    safe_system "git config core.autocrlf false"
+
+    args = ["pull"]
+    args << "--rebase" if ARGV.include? "--rebase"
+    args << "-q" unless ARGV.verbose?
+    args << "origin"
+    # the refspec ensures that 'origin/master' gets updated
+    args << "refs/heads/master:refs/remotes/origin/master"
+
+    safe_system "git", *args
+
+    @current_revision = read_current_revision
+  end
+
+  # Matches raw git diff format (see `man git-diff-tree`)
+  DIFFTREE_RX = /^:[0-7]{6} [0-7]{6} [0-9a-fA-F]{40} [0-9a-fA-F]{40} ([ACDMR])\d{0,3}\t(.+?)(?:\t(.+))?$/
+
+  def report
+    map = Hash.new{ |h,k| h[k] = [] }
+
+    if initial_revision && initial_revision != current_revision
+      `git diff-tree -r --raw -M85% #{initial_revision} #{current_revision}`.each_line do |line|
+        DIFFTREE_RX.match line
+        path = case status = $1.to_sym
+          when :R then $3
+          else $2
+          end
+        path = Pathname.pwd.join(path).relative_path_from(HOMEBREW_REPOSITORY)
+        map[status] << path.to_s
+      end
+    end
+
+    map
+  end
+
+  private
+
+  def read_current_revision
+    `git rev-parse -q --verify HEAD`.chomp
+  end
+
+  def `(cmd)
+    out = Kernel.`(cmd) #`
     if $? && !$?.success?
-      puts out
-      raise "Failed while executing #{cmd}"
+      $stderr.puts out
+      raise ErrorDuringExecution, "Failure while executing: #{cmd}"
     end
     ohai(cmd, out) if ARGV.verbose?
     out
   end
+end
+
+
+class Report < Hash
+
+  def dump
+    # Key Legend: Added (A), Copied (C), Deleted (D), Modified (M), Renamed (R)
+
+    dump_formula_report :A, "New Formulae"
+    dump_formula_report :M, "Updated Formulae"
+    dump_formula_report :D, "Deleted Formulae"
+    dump_formula_report :R, "Renamed Formulae"
+#    dump_new_commands
+#    dump_deleted_commands
+  end
+
+  def tapped_formula_for key
+    fetch(key, []).map do |path|
+      case path when %r{^Library/Taps/(\w+-\w+/.*)}
+        Pathname.new($1)
+      end
+    end.compact
+  end
+
+  def new_tapped_formula
+    tapped_formula_for :A
+  end
+
+  def removed_tapped_formula
+    tapped_formula_for :D
+  end
+
+  def select_formula key
+    fetch(key, []).map do |path|
+      case path when %r{^Library/Formula}
+        File.basename(path, ".rb")
+      when %r{^Library/Taps/(\w+)-(\w+)/(.*)\.rb}
+        "#$1/#$2/#{File.basename(path, '.rb')}"
+      end
+    end.compact.sort
+  end
+
+  def dump_formula_report key, title
+    formula = select_formula(key)
+    unless formula.empty?
+      ohai title
+      puts_columns formula.uniq
+    end
+  end
+
 end
